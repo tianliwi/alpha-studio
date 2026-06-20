@@ -1,0 +1,7 @@
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+data_cache/
+*.parquet
+.DS_Store
