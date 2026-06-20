@@ -1,3 +1,5 @@
+import hashlib
+
 import pandas as pd
 import yfinance as yf
 from loguru import logger
@@ -39,7 +41,8 @@ def normalize_statements(ticker, income, balance, cashflow) -> pd.DataFrame:
 
 def fetch_fundamentals(tickers: list[str], use_cache: bool = True) -> pd.DataFrame:
     """逐只拉取季度财报，合并为标准化长表。单只失败则跳过。"""
-    cache = FUNDAMENTALS_DIR / "fundamentals.parquet"
+    key = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()[:8]
+    cache = FUNDAMENTALS_DIR / f"fundamentals_{key}.parquet"
     if use_cache and cache.exists():
         logger.info(f"fundamentals cache hit: {cache}")
         return pd.read_parquet(cache)
