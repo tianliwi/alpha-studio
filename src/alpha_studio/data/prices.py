@@ -1,3 +1,5 @@
+import hashlib
+
 import pandas as pd
 import yfinance as yf
 from loguru import logger
@@ -5,8 +7,9 @@ from loguru import logger
 from alpha_studio.config import PRICES_DIR
 
 
-def _cache_path(start: str, end: str):
-    return PRICES_DIR / f"prices_{start}_{end}.parquet"
+def _cache_path(tickers: list[str], start: str, end: str):
+    key = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()[:8]
+    return PRICES_DIR / f"prices_{start}_{end}_{key}.parquet"
 
 
 def _field_long(raw: pd.DataFrame, field: str, tickers: list[str]) -> pd.Series:
@@ -20,7 +23,7 @@ def _field_long(raw: pd.DataFrame, field: str, tickers: list[str]) -> pd.Series:
 
 def fetch_prices(tickers: list[str], start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
     """拉取日线开盘价+收盘价，返回 MultiIndex(date, ticker) 长表，列含 'open'、'close'。"""
-    cache = _cache_path(start, end)
+    cache = _cache_path(tickers, start, end)
     if use_cache and cache.exists():
         logger.info(f"price cache hit: {cache}")
         return pd.read_parquet(cache)
