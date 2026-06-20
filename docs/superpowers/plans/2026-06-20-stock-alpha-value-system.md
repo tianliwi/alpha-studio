@@ -4,7 +4,7 @@
 
 **Goal:** 构建一套巴菲特风格、面向 S&P 500、月度调仓的价值投资 alpha 因子发掘与回测系统，CLI 输出排名股票清单与回测报告。
 
-**Architecture:** 轻量模块化管线。6 个单一职责模块（data / factors / evaluation / model / backtest / cli），层间用带 `MultiIndex(date, ticker)` 的 pandas DataFrame + parquet 通信。data 层屏蔽数据源差异（原型用 yfinance），factors 层为纯函数，model 层用 LightGBM walk-forward 合成打分，backtest 层自建月频调仓引擎。
+**Architecture:** 轻量模块化管线。6 个单一职责模块（data / factors / evaluation / model / backtest / cli），层间用带 `MultiIndex(date, ticker)` 的 pandas DataFrame + parquet 通信。data 层屏蔽数据源差异（原型用 yfinance，提供 open+close），factors 层为纯函数（估值因子用调仓日 close 派生 market_cap、每日刷新），model 层用 LightGBM walk-forward 合成打分。执行机制：调仓日 T 收盘算信号 → T+1 开盘成交，收益与标签统一按 open-to-open 口径。backtest 层自建月频调仓引擎。
 
 **Tech Stack:** Python 3.11+, pandas, numpy, yfinance, lightgbm, alphalens-reloaded, pyfolio-reloaded, pyarrow, loguru, typer, pytest.
 
@@ -23,7 +23,7 @@ alpha-studio/
 │   ├── data/
 │   │   ├── __init__.py
 │   │   ├── universe.py        # S&P 500 成分股列表
-│   │   ├── prices.py          # yfinance 日线 + parquet 缓存
+│   │   ├── prices.py          # yfinance 日线 open+close + 执行开盘价 + parquet 缓存
 │   │   └── fundamentals.py    # yfinance 基本面 + parquet 缓存
 │   ├── factors/
 │   │   ├── __init__.py
@@ -175,13 +175,13 @@ def sample_fundamentals():
 
 
 @pytest.fixture
-def sample_prices():
-    """两只股票 4 个月末的收盘价（用于回测）。"""
+def sample_exec_prices():
+    """两只股票 4 个调仓日的成交开盘价（exec_open），用于回测与未来收益。"""
     dates = pd.to_datetime(["2023-01-31", "2023-02-28", "2023-03-31", "2023-04-30"])
     idx = pd.MultiIndex.from_product([dates, ["AAA", "BBB"]], names=["date", "ticker"])
     # AAA 稳定上涨，BBB 下跌
-    close = [10, 20, 11, 19, 12, 18, 13, 17]
-    return pd.DataFrame({"close": close}, index=idx, dtype=float)
+    exec_open = [10, 20, 11, 19, 12, 18, 13, 17]
+    return pd.DataFrame({"exec_open": exec_open}, index=idx, dtype=float)
 ```
 
 - [ ] **Step 5: 安装依赖并验证 pytest 可运行**
@@ -282,20 +282,34 @@ from alpha_studio.data import prices
 
 
 def _fake_yf_download(tickers, **kwargs):
-    dates = pd.to_datetime(["2023-01-31", "2023-02-28"])
-    cols = pd.MultiIndex.from_product([["Close"], tickers])
-    data = [[10.0, 100.0], [11.0, 110.0]]
+    dates = pd.to_datetime(["2023-01-31", "2023-02-01"])
+    cols = pd.MultiIndex.from_product([["Open", "Close"], tickers])
+    # 列顺序: (Open,AAA)(Open,BBB)(Close,AAA)(Close,BBB)
+    data = [[9.5, 99.0, 10.0, 100.0], [10.2, 109.0, 11.0, 110.0]]
     return pd.DataFrame(data, index=dates, columns=cols)
 
 
-def test_fetch_prices_returns_long_multiindex():
+def test_fetch_prices_returns_open_and_close_long():
     with patch("alpha_studio.data.prices.yf.download", side_effect=_fake_yf_download):
         df = prices.fetch_prices(["AAA", "BBB"], "2023-01-01", "2023-03-01", use_cache=False)
     assert list(df.index.names) == ["date", "ticker"]
-    assert "close" in df.columns
-    # 长表：2 日 * 2 股 = 4 行
-    assert len(df) == 4
+    assert "open" in df.columns and "close" in df.columns
+    assert len(df) == 4  # 2 日 * 2 股
     assert df.loc[(pd.Timestamp("2023-01-31"), "AAA"), "close"] == 10.0
+    assert df.loc[(pd.Timestamp("2023-01-31"), "AAA"), "open"] == 9.5
+
+
+def test_execution_open_prices_uses_next_trading_day_open():
+    # 调仓日 T 收盘算信号 → T+1 开盘成交
+    dates = pd.to_datetime(["2023-01-31", "2023-02-01", "2023-02-28"])
+    idx = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    daily = pd.DataFrame(
+        {"open": [9.5, 10.2, 12.0], "close": [10.0, 11.0, 12.5]}, index=idx
+    )
+    rebal = pd.to_datetime(["2023-01-31"])
+    exec_px = prices.execution_open_prices(daily, rebal)
+    # T=2023-01-31 的成交价 = 下一交易日 2023-02-01 的开盘 10.2
+    assert exec_px.loc[(pd.Timestamp("2023-01-31"), "AAA"), "exec_open"] == 10.2
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -318,28 +332,55 @@ def _cache_path(start: str, end: str):
     return PRICES_DIR / f"prices_{start}_{end}.parquet"
 
 
+def _field_long(raw: pd.DataFrame, field: str, tickers: list[str]) -> pd.Series:
+    panel = raw[field]
+    if isinstance(panel, pd.Series):  # 单只股票
+        panel = panel.to_frame(tickers[0])
+    long = panel.stack(future_stack=True).rename(field.lower())
+    long.index = long.index.set_names(["date", "ticker"])
+    return long
+
+
 def fetch_prices(tickers: list[str], start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
-    """拉取日线收盘价，返回 MultiIndex(date, ticker) 长表，列含 'close'。"""
+    """拉取日线开盘价+收盘价，返回 MultiIndex(date, ticker) 长表，列含 'open'、'close'。"""
     cache = _cache_path(start, end)
     if use_cache and cache.exists():
         logger.info(f"price cache hit: {cache}")
         return pd.read_parquet(cache)
 
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
-    close = raw["Close"]
-    if isinstance(close, pd.Series):  # 单只股票
-        close = close.to_frame(tickers[0])
-    long = (
-        close.stack(future_stack=True)
-        .rename("close")
-        .to_frame()
-    )
-    long.index = long.index.set_names(["date", "ticker"])
-    long = long.dropna()
+    open_ = _field_long(raw, "Open", tickers)
+    close = _field_long(raw, "Close", tickers)
+    long = pd.concat([open_, close], axis=1).dropna()
 
     if use_cache:
         long.to_parquet(cache)
     return long
+
+
+def execution_open_prices(daily_prices: pd.DataFrame, rebalance_dates) -> pd.DataFrame:
+    """对每个调仓日 T，取 T 之后第一个交易日的开盘价作为成交价（T 收盘算信号 → T+1 开盘成交）。
+
+    返回 MultiIndex(date=调仓日 T, ticker)，列 'exec_open'。
+    """
+    opens = daily_prices["open"].unstack("ticker").sort_index()
+    rebalance_dates = pd.DatetimeIndex(rebalance_dates)
+
+    rows = []
+    for t in rebalance_dates:
+        later = opens.index[opens.index > t]
+        if len(later) == 0:
+            continue
+        exec_row = opens.loc[later[0]].rename("exec_open").to_frame()
+        exec_row["date"] = t
+        exec_row = exec_row.set_index("date", append=True).reorder_levels(["date", "ticker"])
+        rows.append(exec_row)
+
+    if not rows:
+        return pd.DataFrame(columns=["exec_open"])
+    out = pd.concat(rows).dropna().sort_index()
+    out.index = out.index.set_names(["date", "ticker"])
+    return out
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -351,7 +392,7 @@ Expected: PASS
 
 ```bash
 git add -A
-git commit -m "feat(data): yfinance price fetcher with parquet cache"
+git commit -m "feat(data): yfinance open+close fetcher, execution-open prices"
 ```
 
 ---
@@ -458,9 +499,8 @@ def fetch_fundamentals(tickers: list[str], use_cache: bool = True) -> pd.DataFra
             norm = normalize_statements(
                 t, tk.quarterly_financials, tk.quarterly_balance_sheet, tk.quarterly_cashflow
             )
-            # market_cap / shares_out 取最新快照
+            # shares_out 取最新快照（market_cap 由 pipeline 按每日 close 派生）
             info = tk.fast_info
-            norm["market_cap"] = getattr(info, "market_cap", None)
             norm["shares_out"] = getattr(info, "shares", None)
             frames.append(norm)
         except Exception as e:  # noqa: BLE001
@@ -496,6 +536,8 @@ git commit -m "feat(data): yfinance fundamentals normalizer + fetcher"
 - Create: `src/alpha_studio/factors/definitions.py`
 - Create: `tests/factors/__init__.py` (空)
 - Create: `tests/factors/test_definitions.py`
+
+> 注：`compute_factors` 期望输入已含 `market_cap` 列。该列由 Task 7 pipeline 用「当日 close × shares_out」派生（随价格每日刷新），因此估值因子每日更新；`compute_factors` 本身保持纯函数、与价格来源解耦。下方 fixture 直接带 `market_cap`，模拟 pipeline 合并后的帧。
 
 - [ ] **Step 1: Write the failing test**
 
@@ -606,7 +648,7 @@ git commit -m "feat(factors): value/quality factor definitions"
 - Create: `src/alpha_studio/factors/lag.py`
 - Create: `tests/factors/test_lag.py`
 
-防未来函数核心：财报期 `report_date` 不能在该日立即使用，须延后 `FUNDAMENTAL_LAG_DAYS` 天才算"可见"。本模块把因子从 report_date 对齐到月末调仓日（forward-fill 最近可见财报）。
+防未来函数核心：财报期 `report_date` 不能在该日立即使用，须延后 `FUNDAMENTAL_LAG_DAYS` 天才算"可见"。本模块把按 report_date 的财报字段对齐到月末调仓日（取最近一期已可见财报）。Task 7 中先对**财报字段**做此对齐，再合并当日 close 派生 market_cap、计算因子。函数与列名无关，下方测试用 `roe` 列仅作示意。
 
 - [ ] **Step 1: Write the failing test**
 
@@ -728,6 +770,21 @@ def test_apply_direction_flips_negative_factors():
     out = pipeline.apply_direction(z, {"roe": True, "pb": False})
     assert out.loc[("2023-05-31", "AAA"), "pb"] == -1.0  # 翻转后高 pb 变低分
     assert out.loc[("2023-05-31", "AAA"), "roe"] == 1.0
+
+
+def test_attach_market_cap_from_daily_close():
+    # 对齐后的财报帧（含 shares_out），按调仓日 close 派生 market_cap
+    fund_idx = pd.MultiIndex.from_tuples(
+        [("2023-05-31", "AAA")], names=["date", "ticker"]
+    )
+    aligned = pd.DataFrame({"net_income": [100.0], "shares_out": [100.0]}, index=fund_idx)
+    daily_idx = pd.MultiIndex.from_tuples(
+        [("2023-05-31", "AAA")], names=["date", "ticker"]
+    )
+    daily = pd.DataFrame({"open": [49.0], "close": [50.0]}, index=daily_idx)
+    out = pipeline.attach_market_cap(aligned, daily)
+    # market_cap = close * shares_out = 50 * 100 = 5000
+    assert out.loc[("2023-05-31", "AAA"), "market_cap"] == 5000.0
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -770,18 +827,35 @@ def build_factor_matrix(factors: pd.DataFrame) -> pd.DataFrame:
     return apply_direction(z, FACTOR_DIRECTION)
 
 
+def attach_market_cap(aligned_fund: pd.DataFrame, daily_prices: pd.DataFrame) -> pd.DataFrame:
+    """对齐后的财报帧合并当日 close，派生 market_cap = close * shares_out（随价格每日刷新）。
+
+    aligned_fund / daily_prices 均为 MultiIndex(date, ticker)。
+    """
+    close = daily_prices["close"].rename("close")
+    out = aligned_fund.join(close, how="left")
+    out["market_cap"] = out["close"] * out["shares_out"]
+    return out
+
+
 def build_from_raw(tickers, start, end, rebalance_dates, use_cache=True) -> pd.DataFrame:
-    """端到端：拉基本面→算因子→滞后对齐→标准化。返回 MultiIndex(date, ticker) 因子矩阵。"""
+    """端到端：拉基本面→滞后对齐→按当日 close 派生 market_cap→算因子→标准化。
+
+    估值因子用调仓日 T 的 close 派生 market_cap（每日刷新），符合"T 收盘算信号"。
+    返回 MultiIndex(date, ticker) 因子矩阵。
+    """
     fund = fetch_fundamentals(tickers, use_cache=use_cache)
-    raw_factors = compute_factors(fund)
-    aligned = align_to_rebalance(raw_factors, rebalance_dates, FUNDAMENTAL_LAG_DAYS)
-    return build_factor_matrix(aligned)
+    aligned = align_to_rebalance(fund, rebalance_dates, FUNDAMENTAL_LAG_DAYS)
+    daily = fetch_prices(tickers, start, end, use_cache=use_cache)
+    with_cap = attach_market_cap(aligned, daily)
+    raw_factors = compute_factors(with_cap)
+    return build_factor_matrix(raw_factors)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/factors/test_pipeline.py -v`
-Expected: PASS（两个测试均通过）
+Expected: PASS（三个测试均通过）
 
 - [ ] **Step 5: Commit**
 
@@ -824,12 +898,12 @@ def _make_dataset(n_dates=8, n_stocks=20, seed=0):
     return factors, fwd.rename("fwd_return")
 
 
-def test_compute_forward_returns_shifts_back():
-    # 价格已知，未来收益 = 下一调仓日收益
+def test_compute_forward_returns_open_to_open():
+    # 成交开盘价已知，未来收益 = 下次成交开盘 / 本次成交开盘 - 1
     dates = pd.to_datetime(["2023-01-31", "2023-02-28", "2023-03-31"])
     idx = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
-    prices = pd.DataFrame({"close": [10.0, 11.0, 11.0]}, index=idx)
-    fwd = scorer.compute_forward_returns(prices)
+    exec_prices = pd.DataFrame({"exec_open": [10.0, 11.0, 11.0]}, index=idx)
+    fwd = scorer.compute_forward_returns(exec_prices)
     # 2023-01-31 的未来收益 = 11/10 - 1 = 0.1
     assert np.isclose(fwd.loc[(pd.Timestamp("2023-01-31"), "AAA")], 0.1)
     # 最后一期无未来收益
@@ -866,10 +940,13 @@ import numpy as np
 import pandas as pd
 
 
-def compute_forward_returns(prices: pd.DataFrame) -> pd.Series:
-    """每个调仓日的未来 1 期收益（下一调仓日 close / 当前 close - 1）。"""
-    close = prices["close"].unstack("ticker").sort_index()
-    fwd = close.shift(-1) / close - 1.0
+def compute_forward_returns(exec_prices: pd.DataFrame) -> pd.Series:
+    """每个调仓日的未来 1 期收益，open-to-open：下次成交开盘 / 本次成交开盘 - 1。
+
+    exec_prices: MultiIndex(date, ticker)，列 'exec_open'（T+1 成交开盘价）。
+    """
+    op = exec_prices["exec_open"].unstack("ticker").sort_index()
+    fwd = op.shift(-1) / op - 1.0
     return fwd.stack(future_stack=True).rename("fwd_return")
 
 
@@ -954,25 +1031,25 @@ def test_select_topn_picks_highest_scores():
     assert np.isclose(holdings.iloc[0], 0.5)
 
 
-def test_backtest_returns_match_equal_weight(sample_prices):
+def test_backtest_returns_match_equal_weight(sample_exec_prices):
     # 持仓：每期都持有 AAA + BBB 等权
-    dates = sample_prices.index.get_level_values("date").unique()[:-1]
+    dates = sample_exec_prices.index.get_level_values("date").unique()[:-1]
     idx = pd.MultiIndex.from_product([dates, ["AAA", "BBB"]], names=["date", "ticker"])
     weights = pd.Series(0.5, index=idx, name="weight")
 
-    result = engine.run_backtest(weights, sample_prices, cost=0.0)
-    # 第一期(1-31→2-28)：AAA 10→11(+10%)，BBB 20→19(-5%)，等权 = +2.5%
+    result = engine.run_backtest(weights, sample_exec_prices, cost=0.0)
+    # 第一期 open-to-open：AAA 10→11(+10%)，BBB 20→19(-5%)，等权 = +2.5%
     first_ret = result["returns"].iloc[0]
     assert np.isclose(first_ret, 0.025)
 
 
-def test_backtest_applies_transaction_cost(sample_prices):
-    dates = sample_prices.index.get_level_values("date").unique()[:-1]
+def test_backtest_applies_transaction_cost(sample_exec_prices):
+    dates = sample_exec_prices.index.get_level_values("date").unique()[:-1]
     idx = pd.MultiIndex.from_product([dates, ["AAA", "BBB"]], names=["date", "ticker"])
     weights = pd.Series(0.5, index=idx, name="weight")
 
-    no_cost = engine.run_backtest(weights, sample_prices, cost=0.0)["returns"].iloc[0]
-    with_cost = engine.run_backtest(weights, sample_prices, cost=0.01)["returns"].iloc[0]
+    no_cost = engine.run_backtest(weights, sample_exec_prices, cost=0.0)["returns"].iloc[0]
+    with_cost = engine.run_backtest(weights, sample_exec_prices, cost=0.01)["returns"].iloc[0]
     # 首期建仓换手 100%，成本拉低收益
     assert with_cost < no_cost
 ```
@@ -1002,22 +1079,22 @@ def select_topn(scores: pd.DataFrame, top_n: int) -> pd.Series:
     return weights.rename("weight")
 
 
-def run_backtest(weights: pd.Series, prices: pd.DataFrame, cost: float) -> dict:
-    """按权重逐期持有，计算扣成本后的组合收益序列与累计净值。
+def run_backtest(weights: pd.Series, exec_prices: pd.DataFrame, cost: float) -> dict:
+    """按权重逐期持有，open-to-open 计算扣成本后的组合收益序列与累计净值。
 
-    weights: MultiIndex(date, ticker) 各调仓日目标权重
-    prices: MultiIndex(date, ticker) 含 'close'
+    weights: MultiIndex(date, ticker) 各调仓日目标权重（date=信号日 T）
+    exec_prices: MultiIndex(date, ticker) 含 'exec_open'（T+1 成交开盘价）
     cost: 单边换手成本率
     """
-    close = prices["close"].unstack("ticker").sort_index()
-    period_ret = close.pct_change().shift(-1)  # date 期初→下一日期的收益
+    op = exec_prices["exec_open"].unstack("ticker").sort_index()
+    period_ret = op.pct_change().shift(-1)  # 本次成交开盘 → 下次成交开盘
 
-    w = weights.unstack("ticker").reindex(columns=close.columns).fillna(0.0).sort_index()
+    w = weights.unstack("ticker").reindex(columns=op.columns).fillna(0.0).sort_index()
     rebal_dates = w.index
 
     gross_returns = []
     turnover_list = []
-    prev_w = pd.Series(0.0, index=close.columns)
+    prev_w = pd.Series(0.0, index=op.columns)
     for d in rebal_dates:
         cur_w = w.loc[d]
         turnover = (cur_w - prev_w).abs().sum()
@@ -1204,6 +1281,20 @@ def test_rebalance_dates_are_month_end():
     # 月末日期
     assert all(d.is_month_end for d in dates)
     assert len(dates) == 3  # 1月、2月、3月末
+
+
+def test_snap_to_trading_days_picks_last_trading_day():
+    import pandas as pd
+    from alpha_studio.cli.main import _snap_to_trading_days
+    daily_idx = pd.MultiIndex.from_product(
+        [pd.to_datetime(["2023-01-30", "2023-01-31", "2023-02-01"]), ["AAA"]],
+        names=["date", "ticker"],
+    )
+    daily = pd.DataFrame({"open": [1, 2, 3], "close": [1, 2, 3]}, index=daily_idx, dtype=float)
+    # 日历月末 2023-01-31 是交易日 → 自身；2023-02-28 无样本 → 回退到 02-01
+    snapped = _snap_to_trading_days(pd.to_datetime(["2023-01-31", "2023-02-28"]), daily)
+    assert pd.Timestamp("2023-01-31") in snapped
+    assert pd.Timestamp("2023-02-01") in snapped
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1223,7 +1314,7 @@ from loguru import logger
 
 from alpha_studio.config import REBALANCE_FREQ, TOP_N, TRANSACTION_COST
 from alpha_studio.data.universe import get_sp500_tickers
-from alpha_studio.data.prices import fetch_prices
+from alpha_studio.data.prices import fetch_prices, execution_open_prices
 from alpha_studio.data.fundamentals import fetch_fundamentals
 from alpha_studio.factors.pipeline import build_from_raw
 from alpha_studio.model.scorer import compute_forward_returns, walk_forward_score
@@ -1234,24 +1325,30 @@ app = typer.Typer(help="股票价值投资 alpha 因子发掘系统")
 
 
 def _rebalance_dates(start: str, end: str) -> pd.DatetimeIndex:
+    """日历月末（信号日候选）。实际使用时由 _snap_to_trading_days 对齐到交易日。"""
     return pd.date_range(start, end, freq=REBALANCE_FREQ)
 
 
-def _monthly_prices_long(tickers, start, end) -> pd.DataFrame:
-    prices = fetch_prices(tickers, start, end)
-    monthly = prices["close"].unstack("ticker").resample(REBALANCE_FREQ).last()
-    monthly_long = monthly.stack(future_stack=True).rename("close").to_frame()
-    monthly_long.index = monthly_long.index.set_names(["date", "ticker"])
-    return monthly_long
+def _snap_to_trading_days(calendar_dates, daily_prices) -> pd.DatetimeIndex:
+    """把日历月末对齐到 <= 该日的最后一个交易日（信号日 T）。"""
+    trading = daily_prices.index.get_level_values("date").unique().sort_values()
+    snapped = []
+    for d in calendar_dates:
+        prior = trading[trading <= d]
+        if len(prior):
+            snapped.append(prior[-1])
+    return pd.DatetimeIndex(pd.unique(pd.DatetimeIndex(snapped)))
 
 
 def _build_scores(tickers, start, end):
-    rebal = _rebalance_dates(start, end)
+    """返回 (scores, exec_prices)。信号日 T 收盘算因子，exec_prices 为 T+1 开盘成交价。"""
+    daily = fetch_prices(tickers, start, end)
+    rebal = _snap_to_trading_days(_rebalance_dates(start, end), daily)
     factors = build_from_raw(tickers, start, end, rebal)
-    monthly_long = _monthly_prices_long(tickers, start, end)
-    fwd = compute_forward_returns(monthly_long)
+    exec_prices = execution_open_prices(daily, rebal)
+    fwd = compute_forward_returns(exec_prices)
     scores = walk_forward_score(factors, fwd, min_train_dates=12)
-    return scores, monthly_long
+    return scores, exec_prices
 
 
 @app.command()
@@ -1265,14 +1362,18 @@ def fetch_data(start: str = "2018-01-01", end: str = "2024-12-31"):
 
 @app.command()
 def eval_factors(start: str = "2018-01-01", end: str = "2024-12-31"):
-    """跑 Alphalens 因子有效性诊断。"""
+    """跑 Alphalens 因子有效性诊断（按调仓日收盘价）。"""
     from alpha_studio.evaluation.alphalens_eval import evaluate_factor
     tickers = get_sp500_tickers()
-    rebal = _rebalance_dates(start, end)
+    daily = fetch_prices(tickers, start, end)
+    rebal = _snap_to_trading_days(_rebalance_dates(start, end), daily)
     factors = build_from_raw(tickers, start, end, rebal)
-    monthly_long = _monthly_prices_long(tickers, start, end)
+    # alphalens 评估用调仓日收盘价（因子在 T 收盘可得）
+    close_long = daily.loc[
+        daily.index.get_level_values("date").isin(rebal), ["close"]
+    ].sort_index()
     for col in factors.columns:
-        evaluate_factor(factors[col].dropna(), monthly_long, col)
+        evaluate_factor(factors[col].dropna(), close_long, col)
 
 
 @app.command()
@@ -1284,8 +1385,16 @@ def rank(date: str = typer.Option(None, help="调仓月，如 2024-06；默认�
     if scores.empty:
         typer.echo("无打分结果")
         raise typer.Exit(1)
-    target = scores.index.get_level_values("date").max() if not date \
-        else pd.Timestamp(date) + pd.offsets.MonthEnd(0)
+    score_dates = scores.index.get_level_values("date").unique()
+    if not date:
+        target = score_dates.max()
+    else:
+        month = pd.Period(date, freq="M")
+        in_month = [d for d in score_dates if pd.Period(d, freq="M") == month]
+        if not in_month:
+            typer.echo(f"{date} 无打分数据")
+            raise typer.Exit(1)
+        target = max(in_month)
     day = scores.xs(target, level="date")["score"].nlargest(TOP_N)
     typer.echo(f"== {target.date()} Top {TOP_N} ==")
     for i, (tk, sc) in enumerate(day.items(), 1):
@@ -1296,9 +1405,9 @@ def rank(date: str = typer.Option(None, help="调仓月，如 2024-06；默认�
 def backtest(start: str = "2018-01-01", end: str = "2024-12-31", topk: int = TOP_N):
     """仅回测并输出绩效指标 + tearsheet。"""
     tickers = get_sp500_tickers()
-    scores, monthly_long = _build_scores(tickers, start, end)
+    scores, exec_prices = _build_scores(tickers, start, end)
     weights = select_topn(scores, topk)
-    result = run_backtest(weights, monthly_long, TRANSACTION_COST)
+    result = run_backtest(weights, exec_prices, TRANSACTION_COST)
     metrics = performance_metrics(result["returns"])
     typer.echo("== 回测绩效 ==")
     for k, v in metrics.items():
@@ -1321,7 +1430,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_cli.py -v`
-Expected: PASS（两个测试均通过）
+Expected: PASS（三个测试均通过）
 
 - [ ] **Step 5: 全量测试 + README**
 
@@ -1370,6 +1479,8 @@ git commit -m "feat(cli): typer commands wiring + README"
 - 错误处理（单股跳过、缓存、缺失剔除）→ Tasks 4, 7, 10 中体现 ✓
 - 测试策略（因子手算、防未来函数、回测验证、mock 数据层）→ 各 Task 测试 ✓
 
-**类型一致性:** `compute_forward_returns`、`walk_forward_score`、`select_topn`、`run_backtest` 的签名在定义任务与 CLI 调用处一致；因子矩阵统一 `MultiIndex(date, ticker)`；权重 Series 名为 `weight`；`_monthly_prices_long` 在 CLI 内复用，避免重复（DRY）。
+**类型一致性:** `compute_forward_returns(exec_prices)`、`run_backtest(weights, exec_prices)` 统一消费 `exec_open`（T+1 成交开盘价）；`execution_open_prices` 产出该 panel；因子矩阵统一 `MultiIndex(date, ticker)`；权重 Series 名为 `weight`；`market_cap` 由 `attach_market_cap`（close×shares_out）派生，`compute_factors` 消费之；`walk_forward_score`、`select_topn` 签名在定义与 CLI 调用处一致。
+
+**执行机制一致性（本次微调）:** 信号-成交时序 = T 收盘算因子 → T+1 开盘成交；ML 标签（forward return）与回测收益均按 open-to-open 计算，口径统一，无同日未来函数。估值因子随当日 close 每日刷新。
 
 **已知简化（非占位符，明确决策）:** EDGAR、历史成分股为 spec 第 12 节的未来升级项，原型不实现。

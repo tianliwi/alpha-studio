@@ -54,13 +54,18 @@ alpha-studio/
 
 ```
 1. universe   → 取当前 S&P 500 成分股列表
-2. data       → 拉每只股票日线价格 + 季度财报字段，缓存 parquet
-3. factors    → 在每个调仓日（月末）计算每只股票的因子横截面
+2. data       → 拉每只股票日线价格（open + close）+ 季度财报字段，缓存 parquet
+3. factors    → 在每个调仓日 T 的收盘后计算因子横截面（估值因子用当日 close 派生 market_cap，每日刷新）
 4. evaluation → (研究模式) Alphalens 看各因子 IC/IR，筛掉无效因子
-5. model      → LightGBM 用历史因子→未来1月收益训练，输出当期综合打分
-6. backtest   → 按打分选 Top-N、月度调仓、扣成本，pyfolio 出报告
+5. model      → LightGBM 用历史因子→未来1月收益（open-to-open）训练，输出当期综合打分
+6. backtest   → 按打分选 Top-N、月度调仓、T+1 开盘成交、扣成本，pyfolio 出报告
 7. cli        → 打印当期排名清单 + 保存回测报告
 ```
+
+### 执行机制（避免同日未来函数）
+- **信号-成交时序**：调仓日 T **收盘后**用 T 的收盘价计算因子/打分 → 在 **T+1 交易日开盘价**成交建仓
+- **因子计算口径**：估值类因子（PB、earnings yield、FCF yield、book-to-market）以 `market_cap = 当日 close × shares_out` 派生，随价格每日更新；纯财报类因子（ROE、ROA、毛利率、净利率、D/E）季度内不变
+- **持有期收益口径**：与执行一致，按「本次成交开盘价 → 下次调仓成交开盘价」（open-to-open）计算，ML 标签与回测收益统一用此口径
 
 ## 5. 因子方法论
 
@@ -86,7 +91,9 @@ alpha-studio/
 
 ## 6. 回测引擎（月频，自建薄层）
 
-- 每月末按综合打分选 Top-N（如 Top 20–30 只），等权或按打分加权
+- 调仓日 T 收盘算信号，**T+1 开盘价**成交；持有至下一调仓日的 T+1 开盘价
+- 每次调仓按综合打分选 Top-N（如 Top 20–30 只），等权或按打分加权
+- 持有期收益按 open-to-open 计算（与执行口径一致）
 - 交易成本：每次换仓扣手续费+滑点（如单边 0.1%）
 - 输出指标：年化收益、夏普、最大回撤、胜率、换手率、与 S&P 500 基准对比
 - 用 `pyfolio` 生成 tearsheet 报告（图 + 表）
