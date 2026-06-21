@@ -113,7 +113,8 @@ This installs the package and the `sp` console command **inside the venv**. Once
 
 ```powershell
 # 1. Populate caches: S&P 500 prices (yfinance) + fundamentals (EDGAR).
-#    Slow on first run; cached afterward. EDGAR ~5-15 min for the full universe.
+#    OPTIONAL pre-warm — see note below. Slow on first run; cached afterward.
+#    EDGAR ~5-15 min for the full universe.
 sp fetch-data --start 2021-06-20 --end 2026-06-20
 
 # 2. (Optional) Single-factor effectiveness diagnostics (Alphalens IC/IR).
@@ -133,6 +134,8 @@ python scripts\plot_vs_spy.py
 ```
 
 All commands accept `--start` / `--end` (`YYYY-MM-DD`). Caches make re-runs fast — only the first fetch hits the network.
+
+> **`fetch-data` is optional.** Every command fetches data on demand (cache-aside): `backtest` / `rank` / `run-pipeline` call the same `fetch_prices` / `fetch_fundamentals` internally, so running `sp backtest` on an empty cache simply downloads first, then proceeds — no separate step required. `fetch-data` exists only to **pre-warm or refresh** the cache (e.g. run the slow download once in the background, then iterate quickly). If you do pre-warm, pass the **same `--start`/`--end`** you'll use for the backtest — the price cache is keyed by date range, so mismatched dates won't be reused and the data gets downloaded again. (`fetch-data`'s own defaults differ from `backtest`'s, so always set the dates explicitly.)
 
 > The commands above assume the venv is **activated** (so `sp` and `python` point into `.venv`). With the editable install, `import alpha_studio` works without setting `PYTHONPATH`.
 
