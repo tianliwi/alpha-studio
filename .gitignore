@@ -6,3 +6,4 @@ data_cache/
 *.parquet
 .DS_Store
 reports/
+*.egg-info/
