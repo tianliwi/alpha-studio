@@ -91,10 +91,23 @@ src/alpha_studio/
 
 ```powershell
 cd alpha-studio
+
+# Create and activate a virtual environment (Windows PowerShell)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+# If activation is blocked by execution policy, run once (current user):
+#   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+# cmd.exe:        .\.venv\Scripts\activate.bat
+# macOS / Linux:  python3 -m venv .venv && source .venv/bin/activate
+
+python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-This installs the package and the `sp` console command. (You can equivalently run `python -m alpha_studio.cli.main ...` with `$env:PYTHONPATH="src"`.)
+This installs the package and the `sp` console command **inside the venv**. Once the venv is activated, `sp`, `python`, and `pytest` all resolve to it. Run `deactivate` to exit.
+
+> Without activating, you can call the venv directly: `.\.venv\Scripts\sp backtest ...`
+> or run as a module: `$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m alpha_studio.cli.main backtest ...`
 
 ### Commands
 
@@ -116,10 +129,12 @@ sp rank --date 2026-05 --start 2021-06-20 --end 2026-06-20
 sp run-pipeline --start 2021-06-20 --end 2026-06-20
 
 # 6. (Optional) Strategy vs SPY chart.
-$env:PYTHONPATH="src"; python scripts\plot_vs_spy.py
+python scripts\plot_vs_spy.py
 ```
 
 All commands accept `--start` / `--end` (`YYYY-MM-DD`). Caches make re-runs fast — only the first fetch hits the network.
+
+> The commands above assume the venv is **activated** (so `sp` and `python` point into `.venv`). With the editable install, `import alpha_studio` works without setting `PYTHONPATH`.
 
 ### Switching the fundamentals source
 
