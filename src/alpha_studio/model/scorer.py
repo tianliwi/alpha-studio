@@ -18,6 +18,7 @@ def _train_predict(train_X, train_y, pred_X) -> np.ndarray:
         n_estimators=200, max_depth=3, num_leaves=7,
         learning_rate=0.05, min_child_samples=20,
         subsample=0.8, colsample_bytree=0.8, verbose=-1,
+        random_state=42,
     )
     model.fit(train_X, train_y)
     return model.predict(pred_X)
