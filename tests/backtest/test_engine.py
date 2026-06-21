@@ -48,3 +48,14 @@ def test_backtest_drops_terminal_period_without_next_open(sample_exec_prices):
 
     assert result["returns"].index.tolist() == dates[:-1].tolist()
     assert result["turnover"].index.tolist() == dates[:-1].tolist()
+
+
+def test_performance_metrics():
+    from alpha_studio.backtest import report
+    rets = pd.Series([0.02, -0.01, 0.03, 0.01],
+                     index=pd.date_range("2023-01-31", periods=4, freq="ME"))
+    m = report.performance_metrics(rets)
+    assert "annual_return" in m
+    assert "sharpe" in m
+    assert "max_drawdown" in m
+    assert m["max_drawdown"] <= 0
