@@ -161,6 +161,40 @@ Everything below is written under the project root and is **git-ignored** (`data
 
 **Cache semantics:** caches are keyed by the (sorted) ticker set — and, for prices, the date range. Same inputs → instant cache hit; different universe or price range → a new file. Delete a file to force a refetch. EDGAR fundamentals always store *full* history regardless of `--start`/`--end` (those only window the prices and the backtest).
 
+### How the cache is wired (cache-aside)
+
+You won't find the string `"data_cache"` anywhere outside `config.py` — the path is defined once as a constant and imported by name everywhere else. The flow:
+
+1. **`config.py` defines the paths** (the only literal occurrence of `data_cache`):
+   ```python
+   ROOT = Path(__file__).resolve().parents[2]   # project root
+   CACHE_DIR        = ROOT / "data_cache"
+   PRICES_DIR       = CACHE_DIR / "prices"
+   FUNDAMENTALS_DIR = CACHE_DIR / "fundamentals"
+   ```
+2. **Each data function imports the constant** (not the literal) and builds the parquet path with `pathlib`:
+   ```python
+   from alpha_studio.config import PRICES_DIR
+   cache = PRICES_DIR / f"prices_{start}_{end}_{hash}.parquet"
+   ```
+3. **Read-or-fetch (the cache-aside pattern)** in `fetch_prices` / `fetch_fundamentals_edgar`:
+   ```python
+   if use_cache and cache.exists():
+       return pd.read_parquet(cache)      # HIT  → read from disk, no network
+   raw = yf.download(...)                  # MISS → fetch live
+   long.to_parquet(cache)                 #        write to disk for next time
+   return long
+   ```
+
+So the parquet files are referenced **indirectly through `PRICES_DIR` / `FUNDAMENTALS_DIR`** — `grep data_cache` only hits `config.py`, while `grep PRICES_DIR` shows the call sites. Call chain for `sp backtest`:
+
+```
+cli/main.py backtest() → _build_scores()
+  ├─ fetch_prices()              → PRICES_DIR/prices_*.parquet        (read or fetch)
+  └─ build_from_raw() → fetch_fundamentals()   # dispatches on FUNDAMENTALS_SOURCE
+       └─ fetch_fundamentals_edgar() → FUNDAMENTALS_DIR/edgar_*.parquet (read or fetch)
+```
+
 Reading a cached parquet manually:
 
 ```python
