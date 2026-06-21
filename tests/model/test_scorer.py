@@ -40,3 +40,24 @@ def test_walk_forward_scores_align_with_signal():
                         factors.xs(last, level="date")["roe"]], axis=1).dropna()
     corr = merged["score"].corr(merged["roe"], method="spearman")
     assert corr > 0.3
+
+
+def test_walk_forward_embargoes_most_recent_period(monkeypatch):
+    # 严格无未来函数：预测某调仓日时，训练集必须剔除标签结束于本期成交价的最近一期
+    factors, fwd = _make_dataset(n_dates=8, n_stocks=5)
+    all_dates = sorted(factors.index.get_level_values("date").unique())
+
+    captured = []
+    real_train_predict = scorer._train_predict
+
+    def _spy(train_X, train_y, pred_X):
+        captured.append(train_X.index.get_level_values("date").max())
+        return real_train_predict(train_X, train_y, pred_X)
+
+    monkeypatch.setattr(scorer, "_train_predict", _spy)
+    scorer.walk_forward_score(factors, fwd, min_train_dates=4)
+
+    # 首次打分在 all_dates[4]；embargo 剔除 all_dates[3]，故最大训练日 = all_dates[2]
+    assert captured[0] == all_dates[2]
+    # 训练集绝不能包含被预测日自身或其紧邻的前一期
+    assert captured[0] < all_dates[3]

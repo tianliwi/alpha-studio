@@ -9,7 +9,7 @@ def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
 
 
 def compute_factors(fundamentals: pd.DataFrame) -> pd.DataFrame:
-    """从标准化基本面字段计算价值/质量因子。输入输出均 MultiIndex(report_date, ticker)。"""
+    """从标准化基本面字段计算价值/质量因子。输入输出共享同一 MultiIndex（管线中为 (date, ticker)）。"""
     f = fundamentals
     out = pd.DataFrame(index=f.index)
     # 盈利能力

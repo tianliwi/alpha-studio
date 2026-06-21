@@ -26,7 +26,12 @@ def _train_predict(train_X, train_y, pred_X) -> np.ndarray:
 
 def walk_forward_score(factors: pd.DataFrame, fwd_returns: pd.Series,
                        min_train_dates: int = 12) -> pd.DataFrame:
-    """walk-forward：对每个调仓日，用之前所有 (因子, 未来收益) 训练，预测当期打分。
+    """walk-forward：对每个调仓日，用之前 (因子, 未来收益) 训练，预测当期打分。
+
+    严格无未来函数：标签 fwd_return(T_j)=exec_open(T_{j+1})/exec_open(T_j)-1 在
+    exec_open(T_{j+1})=次日开盘 才实现。预测调仓日 d=T_i（T_i 收盘决策）时，仅可用
+    标签已完全实现的样本，即 T_j < T_{i-1}（最近一期 T_{i-1} 的标签结束于 exec_open(T_i)，
+    决策时尚不可知，必须剔除——单期 embargo）。
 
     返回 MultiIndex(date, ticker)，单列 'score'。
     """
@@ -38,7 +43,8 @@ def walk_forward_score(factors: pd.DataFrame, fwd_returns: pd.Series,
     for i, d in enumerate(all_dates):
         if i < min_train_dates:
             continue
-        train = data[data.index.get_level_values("date") < d].dropna(subset=["fwd_return"])
+        embargo_cutoff = all_dates[i - 1]  # 剔除标签结束于本期成交价的最近一期
+        train = data[data.index.get_level_values("date") < embargo_cutoff].dropna(subset=["fwd_return"])
         train = train.dropna(subset=feature_cols)
         pred = factors.xs(d, level="date", drop_level=False).dropna(subset=feature_cols)
         if train.empty or pred.empty:
