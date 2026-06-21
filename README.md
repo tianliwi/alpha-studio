@@ -198,6 +198,18 @@ cli/main.py backtest() → _build_scores()
        └─ fetch_fundamentals_edgar() → FUNDAMENTALS_DIR/edgar_*.parquet (read or fetch)
 ```
 
+**The caching is application-level code, not a Parquet feature.** Parquet only provides serialization — `df.to_parquet(path)` / `pd.read_parquet(path)` turn a DataFrame ↔ one file at an explicit path. It knows nothing about "cache hits", tickers, or date ranges. Everything *smart* is our own logic:
+
+| Responsibility | Provided by |
+|----------------|-------------|
+| Compute a unique filename/key from tickers + dates (MD5 hash) | our code (`_cache_path`) |
+| Check whether the file exists (`Path.exists()`) | Python stdlib `pathlib` |
+| "Hit → read; miss → download then write" decision | our code (`if/else`) |
+| Download the data | `yfinance` / `requests` |
+| Encode/decode the table as `.parquet` bytes | Parquet format + pandas |
+
+We could swap the storage format to CSV, pickle, or SQLite **without changing a single line of the cache logic** — only the two read/write calls would change. Parquet was chosen purely because it's compact, fast, and preserves dtypes and the `MultiIndex`.
+
 Reading a cached parquet manually:
 
 ```python
