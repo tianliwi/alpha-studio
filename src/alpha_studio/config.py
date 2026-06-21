@@ -12,6 +12,7 @@ TOP_N = 25                      # 每期持仓数
 TRANSACTION_COST = 0.001        # 单边成本（手续费+滑点）
 FUNDAMENTAL_LAG_DAYS = 60       # 财报发布滞后天数
 BENCHMARK = "^GSPC"             # S&P 500 指数
+FUNDAMENTALS_SOURCE = "edgar"   # 基本面数据源："edgar"(SEC,全历史) 或 "yfinance"(近 ~2 年)
 
 for _d in (CACHE_DIR, PRICES_DIR, FUNDAMENTALS_DIR, REPORTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)

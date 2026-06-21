@@ -40,6 +40,19 @@ def normalize_statements(ticker, income, balance, cashflow) -> pd.DataFrame:
 
 
 def fetch_fundamentals(tickers: list[str], use_cache: bool = True) -> pd.DataFrame:
+    """按 config.FUNDAMENTALS_SOURCE 选择数据源，输出统一契约。
+
+    - "edgar": SEC EDGAR 全历史（默认，推荐）。
+    - "yfinance": 逐只拉取季度财报（仅近 ~2 年）。
+    """
+    from alpha_studio.config import FUNDAMENTALS_SOURCE
+    if FUNDAMENTALS_SOURCE == "edgar":
+        from alpha_studio.data.edgar import fetch_fundamentals_edgar
+        return fetch_fundamentals_edgar(tickers, use_cache=use_cache)
+    return fetch_fundamentals_yf(tickers, use_cache=use_cache)
+
+
+def fetch_fundamentals_yf(tickers: list[str], use_cache: bool = True) -> pd.DataFrame:
     """逐只拉取季度财报，合并为标准化长表。单只失败则跳过。"""
     key = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()[:8]
     cache = FUNDAMENTALS_DIR / f"fundamentals_{key}.parquet"
