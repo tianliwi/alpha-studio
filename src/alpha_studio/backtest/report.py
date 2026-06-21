@@ -11,7 +11,8 @@ def performance_metrics(returns: pd.Series) -> dict:
     """从月频收益序列计算关键绩效指标。"""
     returns = returns.dropna()
     if returns.empty:
-        return {"annual_return": np.nan, "sharpe": np.nan, "max_drawdown": np.nan}
+        return {"annual_return": np.nan, "annual_vol": np.nan, "sharpe": np.nan,
+                "max_drawdown": np.nan, "win_rate": np.nan}
     ann_return = (1 + returns).prod() ** (PERIODS_PER_YEAR / len(returns)) - 1
     ann_vol = returns.std(ddof=0) * np.sqrt(PERIODS_PER_YEAR)
     sharpe = ann_return / ann_vol if ann_vol > 0 else np.nan
