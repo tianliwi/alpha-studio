@@ -8,7 +8,11 @@ from alpha_studio.config import FUNDAMENTAL_LAG_DAYS
 
 
 def cross_sectional_zscore(factors: pd.DataFrame) -> pd.DataFrame:
-    """对每个调仓日(date)内做横截面 z-score 标准化。"""
+    """对每个调仓日(date)内做横截面 z-score 标准化。
+
+    注意：当某调仓日某因子全部相等（或仅一只股票）时 std=0，得到 0/0=NaN（非 inf），
+    这是预期行为——下游模型/合成会自然跳过 NaN。
+    """
     def _z(group):
         return (group - group.mean()) / group.std(ddof=0)
     return factors.groupby(level="date", group_keys=False).apply(_z)
@@ -45,6 +49,9 @@ def build_from_raw(tickers, start, end, rebalance_dates, use_cache=True) -> pd.D
 
     估值因子用调仓日 T 的 close 派生 market_cap（每日刷新），符合"T 收盘算信号"。
     返回 MultiIndex(date, ticker) 因子矩阵。
+
+    要求：`rebalance_dates` 必须是交易日（调用方应先用 _snap_to_trading_days 对齐），
+    否则当日无 close 行会导致 market_cap 全为 NaN。
     """
     fund = fetch_fundamentals(tickers, use_cache=use_cache)
     aligned = align_to_rebalance(fund, rebalance_dates, FUNDAMENTAL_LAG_DAYS)
