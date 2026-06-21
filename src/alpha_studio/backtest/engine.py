@@ -19,6 +19,11 @@ def run_backtest(weights: pd.Series, exec_prices: pd.DataFrame, cost: float) -> 
     weights: MultiIndex(date, ticker) 各调仓日目标权重（date=信号日 T）
     exec_prices: MultiIndex(date, ticker) 含 'exec_open'（T+1 成交开盘价）
     cost: 单边换手成本率
+
+    建模假设：某持仓在本期无下一成交开盘价（部分缺失，非整行缺失）时，其
+    weight×NaN 经 .sum(skipna) 视作 0% 贡献（相当于该仓位当期为现金）。
+    原型使用稠密价格面板（fetch_prices 已 dropna），故该情形不出现；接入带
+    停牌/退市缺口的真实数据时应改为按非缺失成分重新归一或断言无部分缺失。
     """
     op = exec_prices["exec_open"].unstack("ticker").sort_index()
     period_ret = op.pct_change().shift(-1)  # 本次成交开盘 → 下次成交开盘
